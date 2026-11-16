@@ -664,6 +664,16 @@ local function updateListCounts()
     blBtn.Text = "BLACKLIST: " .. #blacklist
 end
 
+local function myRoot()
+    local c = localPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function myHum()
+    local c = localPlayer.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
 local rebuildPicker
 do
     -- v8: selector con avatar, buscador por usuario de Roblox y orden por cercania (solo desde la lista)
@@ -885,17 +895,7 @@ end
 local imanBtn = rBtn("IMAN: OFF", 106, Color3.fromRGB(160, 50, 50))
 local lungeBtn = rBtn("LUNGE: ON", 130, Color3.fromRGB(45, 160, 70))
 local fuerzaBtn = rBtn("Fuerza: 4", 154, Color3.fromRGB(70, 130, 220))
-
-local function myRoot()
-    local c = localPlayer.Character
-    return c and c:FindFirstChild("HumanoidRootPart")
-end
-
-local function myHum()
-    local c = localPlayer.Character
-    return c and c:FindFirstChildOfClass("Humanoid")
-end
-
+    
 local function nearestEnemy()
     local r0 = myRoot()
     if not r0 then return nil, math.huge end
