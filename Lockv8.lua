@@ -14,7 +14,7 @@ local SAVE_FILE = "zeidop_hub_config.json"
 local config = {
     buttonSize = 55, buttonVisible = true, isDraggable = true,
     predictEnabled = false, predictAmount = 0.090,
-    useDistance3D = true, smoothMode = false, smoothAmount = 0.35,
+    useDistance3D = true,
     menuTransparency = 0, lockPart = "torso", lockKeyName = "L",
     jumpPower = 50, dashForce = 60, jumpBtnSize = 62, dashBtnSize = 62,
     dashMultiplier = 1.5, dashEnabled = true, instantDash = false,
@@ -60,8 +60,62 @@ local lockKey = Enum.KeyCode[config.lockKeyName] or Enum.KeyCode.L
 local jumping = true
 local stunLocked = false
 local instantDashLastVel = Vector3.new(0, 0, 0)
-local smoothedVelocity = Vector3.new(0, 0, 0)
-local lastTargetPos = nil
+-- v9: historial de posiciones del objetivo (una sola tabla). Mide la velocidad real en una
+-- ventana de TIEMPO (no entre dos frames), asi no depende de tus FPS. No suaviza nada.
+local TH = { t = {}, p = {}, n = 0, head = 0, root = nil, HN = 48, dashStatus = "-" }
+function TH.reset(root)
+    TH.n, TH.head, TH.root = 0, 0, root
+end
+function TH.push(now, root)
+    if TH.root ~= root then TH.reset(root) end
+    local pos = root.Position
+    if TH.n > 0 then
+        -- si paso mucho tiempo sin datos, o fue un teletransporte, se descarta el historial viejo
+        if now - TH.t[TH.head] > 0.25 or (pos - TH.p[TH.head]).Magnitude > 60 then TH.n = 0 end
+    end
+    TH.head = TH.head % TH.HN + 1
+    TH.t[TH.head], TH.p[TH.head] = now, pos
+    if TH.n < TH.HN then TH.n = TH.n + 1 end
+end
+-- posicion registrada hace "age" segundos (entre dos muestras guardadas; solo para MEDIR)
+function TH.posAt(age)
+    local want = TH.t[TH.head] - age
+    local nextIdx = TH.head
+    for k = 1, TH.n - 1 do
+        local idx = (TH.head - 1 - k) % TH.HN + 1
+        if TH.t[idx] <= want then
+            local t0, t1 = TH.t[idx], TH.t[nextIdx]
+            local a = 0
+            if t1 > t0 then a = (want - t0) / (t1 - t0) end
+            return TH.p[idx] + (TH.p[nextIdx] - TH.p[idx]) * a
+        end
+        nextIdx = idx
+    end
+    return nil
+end
+-- velocidad horizontal del objetivo: la que replica Roblox, salvo que contradiga lo que se movio de verdad
+function TH.velocity(root)
+    local rv = root.AssemblyLinearVelocity
+    local v = Vector3.new(rv.X, 0, rv.Z)
+    local vh = nil
+    if TH.root == root and TH.n >= 3 then
+        local pOld = TH.posAt(0.08)
+        if pOld then
+            local d = TH.p[TH.head] - pOld
+            vh = Vector3.new(d.X, 0, d.Z) / 0.08
+        end
+    end
+    if vh then
+        if v.Magnitude < 1 then
+            v = vh
+        elseif vh.Magnitude > 3 then
+            local ratio = v.Magnitude / vh.Magnitude
+            if v.Unit:Dot(vh.Unit) < 0.7 or ratio > 1.8 or ratio < 0.55 then v = vh end
+        end
+    end
+    if v.Magnitude > 150 then v = v.Unit * 150 end
+    return v
+end
 local PREDICT_TIME = config.predictAmount
 local CAMERA_LOCK_NAME = "ZeidopCameraLock"
 local LOGO_ID = 97991220544918
@@ -664,6 +718,7 @@ local function updateListCounts()
     blBtn.Text = "BLACKLIST: " .. #blacklist
 end
 
+-- (v9) estas dos van antes del selector: rebuildPicker usa myRoot()
 local function myRoot()
     local c = localPlayer.Character
     return c and c:FindFirstChild("HumanoidRootPart")
@@ -895,7 +950,7 @@ end
 local imanBtn = rBtn("IMAN: OFF", 106, Color3.fromRGB(160, 50, 50))
 local lungeBtn = rBtn("LUNGE: ON", 130, Color3.fromRGB(45, 160, 70))
 local fuerzaBtn = rBtn("Fuerza: 4", 154, Color3.fromRGB(70, 130, 220))
-    
+
 local function nearestEnemy()
     local r0 = myRoot()
     if not r0 then return nil, math.huge end
@@ -1291,8 +1346,7 @@ local function resetLock()
     lockAimPos = nil
     lockButton.BackgroundColor3 = Color3.fromRGB(190, 45, 45)
     lockButton.Text = "LOCK"
-    lastTargetPos = nil
-    smoothedVelocity = Vector3.new(0, 0, 0)
+    TH.reset(nil)
 end
 
 local function toggleLock()
@@ -1303,8 +1357,7 @@ local function toggleLock()
             targetLock = true
             lockButton.BackgroundColor3 = Color3.fromRGB(45, 170, 70)
             lockButton.Text = "ON"
-            lastTargetPos = nil
-            smoothedVelocity = Vector3.new(0, 0, 0)
+            TH.reset(nil)
         end
     else
         resetLock()
@@ -1313,11 +1366,9 @@ end
 
 lockButton.MouseButton1Click:Connect(toggleLock)
 
-local lastDeltaTime = 1/60
 local MAX_LEAD_RATIO = 0.20
 
 local function cameraLockStep(dt)
-    lastDeltaTime = dt or (1/60)
     if not targetLock or not lockedPlayer or not lockedPlayer.Character then return end
 
     if inList(whitelist, lockedPlayer.Name) then resetLock() return end
@@ -1342,20 +1393,11 @@ local function cameraLockStep(dt)
     local targetPos = aimPart.Position
     local aimPosition = targetPos
 
+    -- v9: el historial se alimenta siempre (asi ya esta listo si enciendes el predict con lock activo)
+    TH.push(os.clock(), root)
+
     if config.predictEnabled then
-        local dtt = math.max(lastDeltaTime, 0.001)
-        local vel = root.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
-        vel = Vector3.new(vel.X, 0, vel.Z)
-
-        if vel.Magnitude < 1 and lastTargetPos then
-            local delta = targetPos - lastTargetPos
-            vel = Vector3.new(delta.X, 0, delta.Z) / dtt
-            -- v5: si lo que "se mueve" es solo ruido de posicion (casi quieto), no hay predict
-            if vel.Magnitude < 8 then vel = Vector3.new(0, 0, 0) end
-        end
-
-        if vel.Magnitude > 150 then vel = vel.Unit * 150 end
-        smoothedVelocity = vel
+        local vel = TH.velocity(root)
 
         if vel.Magnitude >= 1.5 then
             local toTarget = targetPos - Camera.CFrame.Position
@@ -1363,13 +1405,13 @@ local function cameraLockStep(dt)
             if dist > 0.1 then
                 local dir = toTarget.Unit
                 local velPerp = vel - dir * vel:Dot(dir)
-                -- v6: predict efectivo = el tuyo + ajuste por ping/FPS (config.liveComp, en segundos)
-                local comp = (PREDICT_TIME > 0) and (config.liveComp or 0) or 0
-                local pt = PREDICT_TIME + comp
+                -- predict efectivo = el tuyo + ajuste por ping/FPS (config.liveComp, en segundos)
+                local pt = PREDICT_TIME
+                if PREDICT_TIME > 0 then pt = PREDICT_TIME + (config.liveComp or 0) end
                 local lead = velPerp * pt
-                local scale = math.min(3, math.max(1, pt / math.max(PREDICT_TIME, 0.001)))
 
-                local maxLead = math.min(dist * MAX_LEAD_RATIO * scale, 16 * scale)
+                -- tope original del lock (ya no depende del ajuste de ping)
+                local maxLead = math.min(dist * MAX_LEAD_RATIO, 16)
                 if lead.Magnitude > maxLead then
                     lead = lead.Unit * maxLead
                 end
@@ -1379,7 +1421,6 @@ local function cameraLockStep(dt)
         end
     end
 
-    lastTargetPos = targetPos
     lockAimPos = aimPosition
 
     -- MODO LIBRE: no tocar la cámara, solo actualizar lockAimPos
@@ -1489,7 +1530,6 @@ predictToggle.MouseButton1Click:Connect(function()
     predictToggle.Text = config.predictEnabled and "ON" or "OFF"
     predictToggle.BackgroundColor3 = config.predictEnabled and Color3.fromRGB(45, 160, 70) or Color3.fromRGB(160, 50, 50)
     predictLabel.TextColor3 = config.predictEnabled and Color3.fromRGB(255, 220, 130) or Color3.fromRGB(150, 150, 150)
-    smoothedVelocity = Vector3.new(0, 0, 0)
     saveConfig()
 end)
 
@@ -2051,8 +2091,8 @@ do
     local origDir = nil
     local untilT = 0
     local lastH = 0
-    local tPrevRoot, tPrevPos = nil, nil
-    local estVel = Vector3.new(0, 0, 0)
+    -- v9: estado del filtro de dashes con salto (en una tabla para no gastar variables locales)
+    local J = { airSince = nil, lastJump = -10, lastReq = -10, rejectUntil = 0, startT = 0 }
 
     local function usable(c)
         if c:IsA("BodyVelocity") then return true end
@@ -2090,11 +2130,7 @@ do
             return f.Unit
         end
         local r = Vector3.new(tRoot.Position.X - myPos.X, 0, tRoot.Position.Z - myPos.Z)
-        local tv = tRoot.AssemblyLinearVelocity
-        local v = Vector3.new(tv.X, 0, tv.Z)
-
-        if v.Magnitude < 1 and tPrevRoot == tRoot then v = estVel end
-        if v.Magnitude > 150 then v = v.Unit * 150 end
+        local v = TH.velocity(tRoot)
 
         r = r + v * LAG
 
@@ -2120,7 +2156,7 @@ do
         return aim.Unit
     end
 
-    local function startAssist(hrp, drv)
+    local function startAssist(hrp, drv, t0)
         if active then
             if drv and not driver then
                 driver = drv
@@ -2128,13 +2164,32 @@ do
             end
             return
         end
+        local now = os.clock()
+        if now < J.rejectUntil then return end
         local v = drv and getVel(drv) or hrp.AssemblyLinearVelocity
         local h = Vector3.new(v.X, 0, v.Z)
         if h.Magnitude < 10 then return end
+        -- v9: ignorar dashes con salto (estabas en el aire o acabas de saltar)
+        if config.assistIgnoreJump then
+            local t = t0 or now
+            local why = nil
+            if J.airSince and t - J.airSince > 0.06 then
+                why = "estabas en el aire"
+            elseif t - J.lastJump >= 0 and t - J.lastJump < 0.25 then
+                why = "saltaste justo antes"
+            end
+            if why then
+                J.rejectUntil = now + 0.6
+                TH.dashStatus = "ignorado (" .. why .. ")"
+                return
+            end
+        end
         active = true
         driver = drv
         origDir = h.Unit
         untilT = tick() + (drv and 1.5 or WINDOW)
+        J.startT = now
+        TH.dashStatus = "asistiendo"
     end
 
     local function steer(hrp)
@@ -2177,7 +2232,7 @@ do
                     if Vector3.new(vv.X, 0, vv.Z).Magnitude >= 10 then break end
                 end
             end
-            if child.Parent and getTargetRoot() then startAssist(hrp, child) end
+            if child.Parent and getTargetRoot() then startAssist(hrp, child, w0) end
         end)
     end
     if localPlayer.Character then task.spawn(hookChar, localPlayer.Character) end
@@ -2187,23 +2242,26 @@ do
         task.spawn(hookChar, c)
     end)
 
-    RunService.Heartbeat:Connect(function(dt)
-        local tr = getTargetRoot()
-        if tr then
-            local p = tr.Position
-            if tPrevRoot == tr and tPrevPos and dt and dt > 0 then
-                local d = p - tPrevPos
-                estVel = Vector3.new(d.X, 0, d.Z) / dt
+    UserInputService.JumpRequest:Connect(function()
+        local now = os.clock()
+        J.lastJump, J.lastReq = now, now
+    end)
+
+    RunService.Heartbeat:Connect(function()
+        -- seguimiento de aire / salto (para el filtro de dashes con salto)
+        local now = os.clock()
+        local hm = humanoid
+        if hm and hm.Parent then
+            if hm.FloorMaterial == Enum.Material.Air then
+                J.airSince = J.airSince or now
             else
-                estVel = Vector3.new(0, 0, 0)
+                J.airSince = nil
             end
-            tPrevRoot, tPrevPos = tr, p
-        else
-            tPrevRoot, tPrevPos = nil, nil
-            estVel = Vector3.new(0, 0, 0)
+            if hm:GetState() == Enum.HumanoidStateType.Jumping then J.lastJump = now end
         end
 
         if not config.dashAssist then active = false driver = nil return end
+        local tr = getTargetRoot()
         local char = localPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then return end
@@ -2213,12 +2271,17 @@ do
 
         if not active then
             if h > SPIKE_ON and (lastH < SPIKE_OFF or h - lastH > SPIKE_JUMP) and tr then
-                startAssist(hrp, findDriver(hrp))
+                startAssist(hrp, findDriver(hrp), now)
             end
         else
             if (driver and not driver.Parent) or tick() > untilT then
                 active = false
                 driver = nil
+                TH.dashStatus = "dash terminado"
+            elseif config.assistIgnoreJump and J.lastReq > J.startT then
+                active = false
+                driver = nil
+                TH.dashStatus = "cancelado (saltaste durante el dash)"
             else
                 steer(hrp)
             end
@@ -2656,9 +2719,9 @@ do
 end
 
 -- ============================================================
--- ZEIDOP EXTRAS v8  (ya integrado en el hub)
--- Incluye: Dash Assist V2 (auto ping/fps + filtro de saltos), Jump Sync y pestana EXTRA.
--- Sin unlock de FPS, sin sensibilidad y sin prioridad alternativa del lock.
+-- ZEIDOP EXTRAS v9  (ya integrado en el hub)
+-- Incluye: predict adaptativo, Jump Sync, pestana ESTILO y selector de listas.
+-- Un solo Dash Assist (el clasico, con filtro de saltos). Sin V2, sin Lag automatico.
 -- El cerebro del lock (cameraLockStep / faceStep / CAM_PRIORITY) NO se toca.
 -- ============================================================
 do
@@ -2670,7 +2733,7 @@ do
         jumpSync = true, jumpSyncNeedLock = true, jumpSyncRange = 25, jumpSyncDelay = 0, jumpSyncVy = 25,
         btnOpacity = 0, opacityMini = false,
         btnShape = { lock = "circle", jump = "circle", dash = "circle", mini = "circle" },
-        assistMode = "classic", assistFollowLock = true, predictAdaptive = true, predictComp = 1.0, assistAuto = true, assistPingK = 0.7, assistIgnoreJump = true,
+        assistFollowLock = true, assistIgnoreJump = true, predictAdaptive = true, predictComp = 1.0,
     }
     for k, v in pairs(defaults) do
         if config[k] == nil then config[k] = v end
@@ -2693,8 +2756,6 @@ do
             end
         end
     end)
-    -- llaves muertas del lock (nunca se usaron): fuera
-    config.smoothMode, config.smoothAmount = nil, nil
 end
 
 -- ---------- MEDIDOR DE FPS / PING (solo mide, no toca nada) ----------
@@ -2740,322 +2801,6 @@ do
             end
         end
     end)
-end
-
--- ---------- DASH ASSIST V2 ----------
-X.status = "-"
-X.lastMaxT = config.assistMaxT or 0.44
-do
-    local P = X.perf
-    local K = { REF_PING = 28, REF_FRAME = 1 / 120, AIR = 0.06, SPIKE_JUMP = 25, WIN = 0.10, HN = 48 }
-    local S = {
-        active = false, driver = nil, origDir = nil, untilT = 0, startT = 0, lastH = 0,
-        rejectUntil = 0, airSince = nil, lastJump = -10, lastReq = -10, near = nil, lastNear = 0,
-    }
-    local H = { t = {}, p = {}, n = 0, head = 0, root = nil }
-    local F = {}
-    local conn = nil
-    local function cfg(k, d)
-        local v = config[k]
-        if v == nil then return d end
-        return v
-    end
-
-    -- ===== utilidades del driver del dash (igual que el assist original) =====
-    function F.usable(c)
-        if c:IsA("BodyVelocity") then return true end
-        if c:IsA("LinearVelocity") then
-            local ok, rel = pcall(function() return c.RelativeTo end)
-            return ok and rel == Enum.ActuatorRelativeTo.World
-        end
-        return false
-    end
-    function F.getVel(c)
-        if c:IsA("BodyVelocity") then return c.Velocity end
-        return c.VectorVelocity
-    end
-    function F.setVel(c, v)
-        if c:IsA("BodyVelocity") then c.Velocity = v else c.VectorVelocity = v end
-    end
-    function F.findDriver(hrp)
-        for _, c in ipairs(hrp:GetChildren()) do
-            if F.usable(c) then return c end
-        end
-        return nil
-    end
-    function F.targetRoot()
-        if not targetLock or not lockedPlayer then return nil end
-        local ch = lockedPlayer.Character
-        local r = ch and ch:FindFirstChild("HumanoidRootPart")
-        local h = ch and ch:FindFirstChildOfClass("Humanoid")
-        if r and h and h.Health > 0 then return r end
-        return nil
-    end
-
-    -- ===== HISTORIAL DE POSICIONES DEL OBJETIVO (buffer circular con tiempos) =====
-    -- Velocidad por desplazamiento en una ventana de TIEMPO, no por frame: no depende de tus FPS.
-    function F.hReset(root)
-        H.n, H.head, H.root = 0, 0, root
-    end
-    function F.hPush(now, pos)
-        if H.n > 0 and (pos - H.p[H.head]).Magnitude > 60 then H.n = 0 end -- teletransporte/habilidad: descarta
-        H.head = H.head % K.HN + 1
-        H.t[H.head], H.p[H.head] = now, pos
-        if H.n < K.HN then H.n = H.n + 1 end
-    end
-    -- posicion registrada hace "age" segundos (se busca entre dos muestras guardadas)
-    function F.posAt(age)
-        local want = H.t[H.head] - age
-        local nextIdx = H.head
-        for k = 1, H.n - 1 do
-            local idx = (H.head - 1 - k) % K.HN + 1
-            if H.t[idx] <= want then
-                local t0, t1 = H.t[idx], H.t[nextIdx]
-                local a = 0
-                if t1 > t0 then a = (want - t0) / (t1 - t0) end
-                return H.p[idx] + (H.p[nextIdx] - H.p[idx]) * a
-            end
-            nextIdx = idx
-        end
-        return nil
-    end
-    -- velocidad horizontal media entre hace a2 s y hace a1 s (a2 > a1)
-    function F.velBetween(root, a1, a2)
-        if H.root ~= root or H.n < 3 then return nil end
-        local pA, pB = F.posAt(a1), F.posAt(a2)
-        if not pA or not pB then return nil end
-        local d = pA - pB
-        return Vector3.new(d.X, 0, d.Z) / (a2 - a1)
-    end
-    -- 1 = el enemigo va recto y predecible; baja hacia 0.35 si esta girando/haciendo snake
-    function F.stability(root)
-        local v1, v2 = F.velBetween(root, 0, 0.10), F.velBetween(root, 0.12, 0.24)
-        if not v1 or not v2 or v1.Magnitude < 4 or v2.Magnitude < 4 then return 1 end
-        local ang = math.acos(math.clamp(v1.Unit:Dot(v2.Unit), -1, 1))
-        return math.clamp(1 - ang / math.rad(100), 0.35, 1)
-    end
-    -- velocidad del objetivo: la replicada por Roblox, salvo que contradiga lo que realmente se movio
-    function F.targetVel(tRoot)
-        local tv = tRoot.AssemblyLinearVelocity
-        local v = Vector3.new(tv.X, 0, tv.Z)
-        local vh = F.velBetween(tRoot, 0, K.WIN)
-        if vh then
-            if v.Magnitude < 1 then
-                v = vh
-            elseif vh.Magnitude > 3 then
-                local ratio = v.Magnitude / vh.Magnitude
-                if v.Unit:Dot(vh.Unit) < 0.7 or ratio > 1.8 or ratio < 0.55 then v = vh end
-            end
-        end
-        if v.Magnitude > 150 then v = v.Unit * 150 end
-        return v
-    end
-
-    -- ===== AUTO: compensacion de latencia segun ping y FPS (relativo a 28 ms / 120 FPS) =====
-    function F.effLag()
-        local lag = cfg("assistLag", 0.06)
-        if cfg("assistAuto", true) then
-            local dPing = math.max(0, P.ping - K.REF_PING) / 1000
-            local dFrame = math.max(0, P.p90 - K.REF_FRAME)
-            lag = math.clamp(lag + dPing * cfg("assistPingK", 0.7) + dFrame * 0.5, 0, 0.35)
-        end
-        return lag
-    end
-    X.effLag = F.effLag
-
-    function F.interceptDir(myPos, tRoot, speed, maxT)
-        -- v5: con predict encendido, el dash va al MISMO punto al que mira el lock
-        if config.assistFollowLock and config.predictEnabled and lockAimPos then
-            local f = Vector3.new(lockAimPos.X - myPos.X, 0, lockAimPos.Z - myPos.Z)
-            if f.Magnitude < 0.01 then return nil end
-            return f.Unit
-        end
-        local r = Vector3.new(tRoot.Position.X - myPos.X, 0, tRoot.Position.Z - myPos.Z)
-        local v = F.targetVel(tRoot)
-        r = r + v * F.effLag()
-        local a = v:Dot(v) - speed * speed
-        local b = 2 * r:Dot(v)
-        local cc = r:Dot(r)
-        local t = nil
-        if math.abs(a) < 1e-4 then
-            if b < 0 then t = -cc / b end
-        else
-            local disc = b * b - 4 * a * cc
-            if disc >= 0 then
-                local sq = math.sqrt(disc)
-                local t1, t2 = (-b - sq) / (2 * a), (-b + sq) / (2 * a)
-                if t1 > 0 and t2 > 0 then t = math.min(t1, t2)
-                elseif t1 > 0 then t = t1
-                elseif t2 > 0 then t = t2 end
-            end
-        end
-        t = math.clamp(t or 0, 0, maxT)
-        local aim = r + v * t
-        if aim.Magnitude < 0.01 then return nil end
-        return aim.Unit
-    end
-
-    -- ===== FILTRO DE DASH CON SALTO =====
-    function F.jumpDashReason(t0)
-        if S.airSince and t0 - S.airSince > K.AIR then return "estabas en el aire" end
-        local dj = t0 - S.lastJump
-        if dj >= 0 and dj < 0.25 then return "saltaste justo antes" end
-        return nil
-    end
-
-    function F.startAssist(hrp, drv, t0)
-        if S.active then
-            if drv and not S.driver then
-                S.driver = drv
-                S.untilT = os.clock() + 1.5
-            end
-            return
-        end
-        local now = os.clock()
-        if now < S.rejectUntil then return end
-        local v = drv and F.getVel(drv) or hrp.AssemblyLinearVelocity
-        local h = Vector3.new(v.X, 0, v.Z)
-        if h.Magnitude < 10 then return end
-        if cfg("assistIgnoreJump", true) then
-            local why = F.jumpDashReason(t0 or now)
-            if why then
-                S.rejectUntil = now + 0.6
-                X.status = "ignorado (" .. why .. ")"
-                return
-            end
-        end
-        S.active, S.driver, S.origDir = true, drv, h.Unit
-        S.startT = now
-        S.untilT = now + (drv and 1.5 or cfg("assistWindow", 0.35))
-        X.status = "asistiendo"
-    end
-
-    function F.steer(hrp)
-        local tRoot = F.targetRoot()
-        if not tRoot or not S.origDir then return end
-        local cur = (S.driver and S.driver.Parent) and F.getVel(S.driver) or hrp.AssemblyLinearVelocity
-        local speedH = Vector3.new(cur.X, 0, cur.Z).Magnitude
-        if speedH < 10 then return end
-        local toT = Vector3.new(tRoot.Position.X - hrp.Position.X, 0, tRoot.Position.Z - hrp.Position.Z)
-        if toT.Magnitude < cfg("assistStopDist", 3) then return end
-        local ang = math.acos(math.clamp(S.origDir:Dot(toT.Unit), -1, 1))
-        if ang > math.rad(cfg("assistAngle", 50)) then return end
-        local maxT = cfg("assistMaxT", 0.44)
-        if cfg("assistAuto", true) then
-            maxT = math.max(0.1, maxT * F.stability(tRoot)) -- Max T lo decide el auto segun lo predecible que sea el enemigo
-        end
-        X.lastMaxT = maxT
-        local dir = F.interceptDir(hrp.Position, tRoot, speedH, maxT)
-        if not dir then return end
-        local nv = Vector3.new(dir.X * speedH, cur.Y, dir.Z * speedH)
-        if S.driver and S.driver.Parent then
-            F.setVel(S.driver, nv)
-        else
-            hrp.AssemblyLinearVelocity = nv
-        end
-    end
-
-    function F.hookChar(char)
-        if conn then conn:Disconnect() conn = nil end
-        local hrp = char:WaitForChild("HumanoidRootPart", 5)
-        if not hrp then return end
-        conn = hrp.ChildAdded:Connect(function(child)
-            if config.assistMode ~= "v2" or not F.usable(child) then return end
-            local t0 = os.clock()
-            for _ = 1, 3 do
-                RunService.Heartbeat:Wait()
-                if not child.Parent then return end
-                if os.clock() - t0 >= 0.016 then
-                    local vv = F.getVel(child)
-                    if Vector3.new(vv.X, 0, vv.Z).Magnitude >= 10 then break end
-                end
-            end
-            if child.Parent and F.targetRoot() then F.startAssist(hrp, child, t0) end
-        end)
-    end
-
-    UserInputService.JumpRequest:Connect(function()
-        local now = os.clock()
-        S.lastJump, S.lastReq = now, now
-    end)
-
-    RunService.Heartbeat:Connect(function()
-        local now = os.clock()
-        -- seguimiento de aire / salto (siempre, para tenerlo listo cuando dasheas)
-        local hum = humanoid
-        if hum and hum.Parent then
-            if hum.FloorMaterial == Enum.Material.Air then
-                S.airSince = S.airSince or now
-            else
-                S.airSince = nil
-            end
-            if hum:GetState() == Enum.HumanoidStateType.Jumping then S.lastJump = now end
-        end
-
-        -- historial del objetivo: del bloqueado o, si no hay lock, del enemigo mas cercano
-        -- (asi ya existe cuando pulsas LOCK justo antes del dash)
-        local tr = F.targetRoot()
-        local cand = tr
-        if not cand and config.assistMode == "v2" then
-            if now - S.lastNear > 0.15 then
-                S.lastNear = now
-                S.near = (nearestEnemy())
-            end
-            cand = S.near
-        end
-        if cand and cand.Parent then
-            if H.root ~= cand then F.hReset(cand) end
-            F.hPush(now, cand.Position)
-        elseif H.root then
-            F.hReset(nil)
-        end
-
-        if config.assistMode ~= "v2" then
-            S.active, S.driver = false, nil
-            return
-        end
-        local char = localPlayer.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if not hrp then return end
-        local v = hrp.AssemblyLinearVelocity
-        local h = math.sqrt(v.X * v.X + v.Z * v.Z)
-
-        if not S.active then
-            if h > cfg("assistSpikeOn", 50)
-                and (S.lastH < cfg("assistSpikeOff", 35) or h - S.lastH > K.SPIKE_JUMP)
-                and tr then
-                F.startAssist(hrp, F.findDriver(hrp), now)
-            end
-        elseif (S.driver and not S.driver.Parent) or now > S.untilT then
-            S.active, S.driver = false, nil
-            X.status = "dash terminado"
-        elseif cfg("assistIgnoreJump", true) and S.lastReq > S.startT then
-            S.active, S.driver = false, nil
-            X.status = "cancelado (saltaste durante el dash)"
-        else
-            F.steer(hrp)
-        end
-        S.lastH = h
-    end)
-
-    if localPlayer.Character then task.spawn(F.hookChar, localPlayer.Character) end
-    localPlayer.CharacterAdded:Connect(function(c)
-        S.active, S.driver = false, nil
-        F.hReset(nil)
-        task.spawn(F.hookChar, c)
-    end)
-
-    -- modos: v2 (este) / classic (assist viejo del hub) / off
-    function X.applyMode()
-        local m = config.assistMode
-        if m ~= "v2" and m ~= "classic" and m ~= "off" then
-            m = "classic"
-            config.assistMode = m
-        end
-        config.dashAssist = (m == "classic") -- el motor viejo solo corre en modo classic
-        if m ~= "v2" then S.active, S.driver = false, nil end
-    end
-    X.applyMode()
 end
 
 -- ---------- JUMP SYNC: saltar cuando el enemigo salta ----------
@@ -3586,49 +3331,16 @@ do
     U.use(dashPage)
     U.header("AJUSTES DEL ASSIST")
     do
-        local t = U.card(5)
-        local f = U.btn("", t, 1, "F", nil, 12)
-        U.toggle(f, "Dash sigue al lock", function() return config.assistFollowLock end, function(v) config.assistFollowLock = v end)
-        local a = U.btn("", t, 2, "L")
-        U.toggle(a, "Auto ping/fps", function() return config.assistAuto end, function(v) config.assistAuto = v end)
-        local j = U.btn("", t, 2, "R")
+        local t = U.card(3)
+        local a = U.btn("", t, 1, "L", nil, 11)
+        U.toggle(a, "Sigue al lock", function() return config.assistFollowLock end, function(v) config.assistFollowLock = v end)
+        local j = U.btn("", t, 1, "R", nil, 11)
         U.toggle(j, "Ignorar salto", function() return config.assistIgnoreJump end, function(v) config.assistIgnoreJump = v end)
-        local l = U.label("", t, 3, 2, 12)
-        U.stepper(l, U.col("-", t, 3, 2), U.col("+", t, 3, 1), "Ping x: %.2f",
-            function() return config.assistPingK end, function(v) config.assistPingK = v end, 0, 1.5, 0.05)
-        W.eff = U.label("", t, 4, 0, 11)
-        W.dbg = U.label("", t, 5, 0, 11)
+        W.eff = U.label("", t, 2, 0, 11)
+        W.dbg = U.label("", t, 3, 0, 11)
     end
+    U.hint("Sigue al lock: con predict encendido el dash va al mismo punto que la camara. Ignorar salto: no corrige dashes hechos con salto.", 44)
     U.finish()
-
-    -- boton de modo del assist: reemplaza al viejo en la pestana DASH (mismo lugar y tamano)
-    do
-        local old = nil
-        for _, c in ipairs(dashPage:GetChildren()) do
-            if c:IsA("TextButton") and string.sub(c.Text, 1, 11) == "DASH ASSIST" then
-                old = c
-                break
-            end
-        end
-        if old then
-            local nb = old:Clone()
-            nb.Parent = old.Parent
-            old.Visible = false
-            local function paint()
-                local m = config.assistMode
-                nb.Text = "ASSIST: " .. (m == "v2" and "V2 AUTO" or (m == "classic" and "CLASICO" or "OFF"))
-                nb.BackgroundColor3 = (m == "v2" and C.on) or (m == "classic" and C.blue) or C.off
-            end
-            paint()
-            nb.MouseButton1Click:Connect(function()
-                local nxt = { v2 = "classic", classic = "off", off = "v2" }
-                config.assistMode = nxt[config.assistMode] or "classic"
-                X.applyMode()
-                paint()
-                saveConfig()
-            end)
-        end
-    end
 
     -- la pestana LOCK es la que esta abierta al inicio: ajusta su scroll al nuevo largo
     if host then host.CanvasSize = UDim2.new(0, 0, 0, lockPage.Size.Y.Offset) end
@@ -3647,10 +3359,10 @@ do
                     l2 = string.format("Dash apunta como el lock (predict %d ms)",
                         math.floor((config.predictAmount + (config.liveComp or 0)) * 1000 + 0.5))
                 else
-                    l2 = string.format("Lag ef.: %.3fs  -  Max T ef.: %.2f", X.effLag(), X.lastMaxT)
+                    l2 = "Dash con Lag / Max T fijos (engranaje)"
                 end
                 W.eff.Text = string.format("FPS %d  -  Ping %d ms\n", math.floor(P.fps + 0.5), math.floor(P.ping + 0.5)) .. l2
-                W.dbg.Text = "Ultimo dash: " .. X.status
+                W.dbg.Text = "Ultimo dash: " .. TH.dashStatus
             end
             if lockPage.Visible then
                 if config.predictEnabled then
@@ -3669,5 +3381,5 @@ do
     end)
 end
 
-    print("Zeidop Hub v8 OK - LOCK + ASSIST + PREDICT ADAPTATIVO + JUMP SYNC + ESTILO + SELECTOR")
+print("Zeidop Hub v9 OK - LOCK + ASSIST + PREDICT ADAPTATIVO + JUMP SYNC + ESTILO + SELECTOR")
 end
