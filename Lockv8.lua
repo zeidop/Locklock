@@ -1432,7 +1432,7 @@ local function cameraLockStep(dt)
     if look.Magnitude < 0.1 then return end
     look = look.Unit
 
-    if config.aboveView and #blacklist > 0 and inList(blacklist, lockedPlayer.Name) then
+    if config.aboveView then
         local flat = Vector3.new(look.X, 0, look.Z)
         if flat.Magnitude > 0.01 then
             local fu = flat.Unit
