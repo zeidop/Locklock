@@ -21,7 +21,7 @@ local config = {
     antiStun = false, dashAssist = true,
     assistAngle = 50, assistMaxT = 0.44, assistStopDist = 3,
     assistSpikeOn = 50, assistSpikeOff = 35, assistWindow = 0.35, assistLag = 0.06,
-    aboveView = false, aboveHeight = 12,
+    aboveView = false, aboveHeight = 3,
     lockBtnXScale = 0.75, lockBtnXOffset = 0,
     lockBtnYScale = 0.65, lockBtnYOffset = 0,
     lockFree = false
