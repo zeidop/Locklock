@@ -1570,7 +1570,7 @@ aboveBtn.MouseButton1Click:Connect(function()
 end)
 
 aboveHeightBtn.MouseButton1Click:Connect(function()
-    local h = config.aboveHeight + 3
+    local h = config.aboveHeight + 1
     if h > 24 then h = 6 end
     config.aboveHeight = h
     aboveHeightBtn.Text = "Altura: " .. h
