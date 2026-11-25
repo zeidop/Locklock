@@ -21,7 +21,7 @@ local config = {
     antiStun = false, dashAssist = true,
     assistAngle = 50, assistMaxT = 0.44, assistStopDist = 3,
     assistSpikeOn = 50, assistSpikeOff = 35, assistWindow = 0.35, assistLag = 0.06,
-    aboveView = false, aboveHeight = 3,
+    aboveView = false, aboveHeight = 12,
     lockBtnXScale = 0.75, lockBtnXOffset = 0,
     lockBtnYScale = 0.65, lockBtnYOffset = 0,
     lockFree = false
@@ -116,6 +116,8 @@ function TH.velocity(root)
     if v.Magnitude > 150 then v = v.Unit * 150 end
     return v
 end
+config.predictAmount = math.clamp(tonumber(config.predictAmount) or 0, 0, 0.300)
+config.aboveHeight = math.clamp(tonumber(config.aboveHeight) or 12, 3, 24)
 local PREDICT_TIME = config.predictAmount
 local CAMERA_LOCK_NAME = "ZeidopCameraLock"
 local LOGO_ID = 97991220544918
@@ -380,7 +382,18 @@ local sizeLabel = smallLabel("Tamano: " .. config.buttonSize, 30)
 local sizeMinus = smallBtn("-", 110, 28, 28)
 local sizePlus = smallBtn("+", 142, 28, 28)
 
-local predictLabel = smallLabel(string.format("Predict: %.3fs", config.predictAmount), 58, Color3.fromRGB(255, 220, 130))
+local predictLabel = Instance.new("TextBox") -- escribible (0 a 0.300 s)
+predictLabel.Size = UDim2.new(0.55, 0, 0, 16)
+predictLabel.Position = UDim2.new(0, 0, 0, 58)
+predictLabel.BackgroundTransparency = 1
+predictLabel.Text = string.format("Predict: %.3fs", config.predictAmount)
+predictLabel.PlaceholderText = "0 - 0.300"
+predictLabel.TextColor3 = Color3.fromRGB(255, 220, 130)
+predictLabel.TextSize = 10
+predictLabel.Font = Enum.Font.Gotham
+predictLabel.TextXAlignment = Enum.TextXAlignment.Left
+predictLabel.ClearTextOnFocus = true
+predictLabel.Parent = lockPage
 local predictMinus = smallBtn("-0.001", 80, 56, 28)
 local predictPlus = smallBtn("+0.001", 112, 56, 28)
 local predictToggle = smallBtn(config.predictEnabled and "ON" or "OFF", 144, 56, 28, config.predictEnabled and Color3.fromRGB(45, 160, 70) or Color3.fromRGB(160, 50, 50))
@@ -402,7 +415,20 @@ local partBtn = halfBtn("Parte: " .. (config.lockPart == "head" and "Cabeza" or 
 local keyBtn = halfBtn("Tecla: " .. lockKey.Name, 132, true, Color3.fromRGB(70, 130, 220))
 
 local aboveBtn = halfBtn("Above: " .. (config.aboveView and "ON" or "OFF"), 162, false, config.aboveView and Color3.fromRGB(45, 160, 70) or Color3.fromRGB(160, 50, 50))
-local aboveHeightBtn = halfBtn("Altura: " .. config.aboveHeight, 162, true, Color3.fromRGB(70, 130, 220))
+local aboveHeightBtn = Instance.new("TextBox") -- escribible (3 a 24)
+aboveHeightBtn.Size = UDim2.new(0.5, -2, 0, 24)
+aboveHeightBtn.Position = UDim2.new(0.5, 2, 0, 162)
+aboveHeightBtn.BackgroundColor3 = Color3.fromRGB(70, 130, 220)
+aboveHeightBtn.Text = "Altura: " .. config.aboveHeight
+aboveHeightBtn.PlaceholderText = "3 - 24"
+aboveHeightBtn.PlaceholderColor3 = Color3.fromRGB(215, 225, 245)
+aboveHeightBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+aboveHeightBtn.TextSize = 10
+aboveHeightBtn.Font = Enum.Font.GothamBold
+aboveHeightBtn.ClearTextOnFocus = true
+aboveHeightBtn.BorderSizePixel = 0
+aboveHeightBtn.Parent = lockPage
+Instance.new("UICorner", aboveHeightBtn).CornerRadius = UDim.new(0, 6)
 
 -- BOTÓN MODO NORMAL / LIBRE
 local modeBtn = halfBtn("Modo: " .. (config.lockFree and "LIBRE" or "NORMAL"), 192, false, config.lockFree and Color3.fromRGB(80, 60, 140) or Color3.fromRGB(70, 130, 220))
@@ -1338,12 +1364,14 @@ end
 
 local FACE_TARGET = true
 local lockAimPos = nil
+local dashAimPos = nil -- v10.5: punto al que apunta el dash (su propio predict)
 local FACE_BIND_NAME = "ZeidopLockFace"
 
 local function resetLock()
     targetLock = false
     lockedPlayer = nil
     lockAimPos = nil
+    dashAimPos = nil
     lockButton.BackgroundColor3 = Color3.fromRGB(190, 45, 45)
     lockButton.Text = "LOCK"
     TH.reset(nil)
@@ -1367,6 +1395,20 @@ end
 lockButton.MouseButton1Click:Connect(toggleLock)
 
 local MAX_LEAD_RATIO = 0.20
+
+-- v10.5: punto adelantado para un tiempo de predict dado. Solo la velocidad PERPENDICULAR a la
+-- linea origen->objetivo cambia la direccion; ratio/maxStud limitan cuanto se puede adelantar.
+local function leadPoint(targetPos, vel, origin, pt, ratio, maxStud)
+    local toTarget = targetPos - origin
+    local dist = toTarget.Magnitude
+    if dist <= 0.1 then return targetPos end
+    local dir = toTarget.Unit
+    local velPerp = vel - dir * vel:Dot(dir)
+    local lead = velPerp * pt
+    local maxLead = math.min(dist * ratio, maxStud)
+    if lead.Magnitude > maxLead then lead = lead.Unit * maxLead end
+    return targetPos + lead
+end
 
 local function cameraLockStep(dt)
     if not targetLock or not lockedPlayer or not lockedPlayer.Character then return end
@@ -1396,28 +1438,20 @@ local function cameraLockStep(dt)
     -- v9: el historial se alimenta siempre (asi ya esta listo si enciendes el predict con lock activo)
     TH.push(os.clock(), root)
 
+    dashAimPos = targetPos
     if config.predictEnabled then
         local vel = TH.velocity(root)
-
         if vel.Magnitude >= 1.5 then
-            local toTarget = targetPos - Camera.CFrame.Position
-            local dist = toTarget.Magnitude
-            if dist > 0.1 then
-                local dir = toTarget.Unit
-                local velPerp = vel - dir * vel:Dot(dir)
-                -- predict efectivo = el tuyo + ajuste por ping/FPS (config.liveComp, en segundos)
-                local pt = PREDICT_TIME
-                if PREDICT_TIME > 0 then pt = PREDICT_TIME + (config.liveComp or 0) end
-                local lead = velPerp * pt
-
-                -- tope original del lock (ya no depende del ajuste de ping)
-                local maxLead = math.min(dist * MAX_LEAD_RATIO, 16)
-                if lead.Magnitude > maxLead then
-                    lead = lead.Unit * maxLead
-                end
-
-                aimPosition = targetPos + lead
-            end
+            local camPos0 = Camera.CFrame.Position
+            -- camara / M1 / habilidades: tu predict + ajuste por ping/FPS (tope original del lock)
+            local pt = PREDICT_TIME
+            if PREDICT_TIME > 0 then pt = PREDICT_TIME + (config.liveComp or 0) end
+            aimPosition = leadPoint(targetPos, vel, camPos0, pt, MAX_LEAD_RATIO, 16)
+            -- dash: su propio predict + el mismo ajuste; se mide desde TU personaje y con tope amplio
+            local dpt = config.dashPredict or PREDICT_TIME
+            if dpt > 0 then dpt = dpt + (config.liveComp or 0) end
+            local mr0 = myRoot()
+            dashAimPos = leadPoint(targetPos, vel, mr0 and mr0.Position or camPos0, dpt, 0.6, 30)
         end
     end
 
@@ -1518,11 +1552,25 @@ predictMinus.MouseButton1Click:Connect(function()
 end)
 
 predictPlus.MouseButton1Click:Connect(function()
-    config.predictAmount = math.min(0.5, config.predictAmount + 0.001)
+    config.predictAmount = math.min(0.300, config.predictAmount + 0.001)
     config.predictAmount = math.floor(config.predictAmount * 1000 + 0.5) / 1000
     PREDICT_TIME = config.predictAmount
     predictLabel.Text = string.format("Predict: %.3fs", config.predictAmount)
     saveConfig()
+end)
+
+-- escribir el predict del lock: acepta 0.09 / 0,09 (segundos) o 90 (ms). Maximo 0.300
+predictLabel.FocusLost:Connect(function()
+    local txt = (predictLabel.Text or ""):gsub(",", ".")
+    local n = tonumber(txt:match("%d*%.?%d+"))
+    if n then
+        if n > 1 then n = n / 1000 end
+        n = math.clamp(n, 0, 0.300)
+        config.predictAmount = math.floor(n * 1000 + 0.5) / 1000
+        PREDICT_TIME = config.predictAmount
+        saveConfig()
+    end
+    predictLabel.Text = string.format("Predict: %.3fs", config.predictAmount)
 end)
 
 predictToggle.MouseButton1Click:Connect(function()
@@ -1569,12 +1617,15 @@ aboveBtn.MouseButton1Click:Connect(function()
     saveConfig()
 end)
 
-aboveHeightBtn.MouseButton1Click:Connect(function()
-    local h = config.aboveHeight + 1
-    if h > 24 then h = 3 end
-    config.aboveHeight = h
-    aboveHeightBtn.Text = "Altura: " .. h
-    saveConfig()
+-- altura de above: solo escrita, de 3 a 24
+aboveHeightBtn.FocusLost:Connect(function()
+    local txt = (aboveHeightBtn.Text or ""):gsub(",", ".")
+    local n = tonumber(txt:match("%d*%.?%d+"))
+    if n then
+        config.aboveHeight = math.clamp(math.floor(n + 0.5), 3, 24)
+        saveConfig()
+    end
+    aboveHeightBtn.Text = "Altura: " .. config.aboveHeight
 end)
 
 modeBtn.MouseButton1Click:Connect(function()
@@ -1802,6 +1853,8 @@ end)
 
 -- Aplicar visuales iniciales
 local function refreshAllVisuals()
+    config.predictAmount = math.clamp(tonumber(config.predictAmount) or 0, 0, 0.300)
+    config.aboveHeight = math.clamp(tonumber(config.aboveHeight) or 12, 3, 24)
     lockButton.Size = UDim2.new(0, config.buttonSize, 0, config.buttonSize)
     lockButton.Visible = config.buttonVisible
     sizeLabel.Text = "Tamano: " .. tostring(config.buttonSize)
@@ -2091,8 +2144,6 @@ do
     local origDir = nil
     local untilT = 0
     local lastH = 0
-    -- v9: estado del filtro de dashes con salto (en una tabla para no gastar variables locales)
-    local J = { airSince = nil, lastJump = -10, lastReq = -10, rejectUntil = 0, startT = 0 }
 
     local function usable(c)
         if c:IsA("BodyVelocity") then return true end
@@ -2123,9 +2174,9 @@ do
     end
 
     local function interceptDir(myPos, tRoot, speed)
-        -- v5: con predict encendido, el dash va al MISMO punto al que mira el lock
-        if config.assistFollowLock and config.predictEnabled and lockAimPos then
-            local f = Vector3.new(lockAimPos.X - myPos.X, 0, lockAimPos.Z - myPos.Z)
+        -- v10.5: con predict encendido, el dash va a SU punto (dashAimPos), con su propio predict
+        if config.assistFollowLock and config.predictEnabled and dashAimPos then
+            local f = Vector3.new(dashAimPos.X - myPos.X, 0, dashAimPos.Z - myPos.Z)
             if f.Magnitude < 0.01 then return nil end
             return f.Unit
         end
@@ -2156,7 +2207,7 @@ do
         return aim.Unit
     end
 
-    local function startAssist(hrp, drv, t0)
+    local function startAssist(hrp, drv)
         if active then
             if drv and not driver then
                 driver = drv
@@ -2164,31 +2215,13 @@ do
             end
             return
         end
-        local now = os.clock()
-        if now < J.rejectUntil then return end
         local v = drv and getVel(drv) or hrp.AssemblyLinearVelocity
         local h = Vector3.new(v.X, 0, v.Z)
         if h.Magnitude < 10 then return end
-        -- v9: ignorar dashes con salto (estabas en el aire o acabas de saltar)
-        if config.assistIgnoreJump then
-            local t = t0 or now
-            local why = nil
-            if J.airSince and t - J.airSince > 0.06 then
-                why = "estabas en el aire"
-            elseif t - J.lastJump >= 0 and t - J.lastJump < 0.25 then
-                why = "saltaste justo antes"
-            end
-            if why then
-                J.rejectUntil = now + 0.6
-                TH.dashStatus = "ignorado (" .. why .. ")"
-                return
-            end
-        end
         active = true
         driver = drv
         origDir = h.Unit
         untilT = tick() + (drv and 1.5 or WINDOW)
-        J.startT = now
         TH.dashStatus = "asistiendo"
     end
 
@@ -2232,7 +2265,7 @@ do
                     if Vector3.new(vv.X, 0, vv.Z).Magnitude >= 10 then break end
                 end
             end
-            if child.Parent and getTargetRoot() then startAssist(hrp, child, w0) end
+            if child.Parent and getTargetRoot() then startAssist(hrp, child) end
         end)
     end
     if localPlayer.Character then task.spawn(hookChar, localPlayer.Character) end
@@ -2242,24 +2275,7 @@ do
         task.spawn(hookChar, c)
     end)
 
-    UserInputService.JumpRequest:Connect(function()
-        local now = os.clock()
-        J.lastJump, J.lastReq = now, now
-    end)
-
     RunService.Heartbeat:Connect(function()
-        -- seguimiento de aire / salto (para el filtro de dashes con salto)
-        local now = os.clock()
-        local hm = humanoid
-        if hm and hm.Parent then
-            if hm.FloorMaterial == Enum.Material.Air then
-                J.airSince = J.airSince or now
-            else
-                J.airSince = nil
-            end
-            if hm:GetState() == Enum.HumanoidStateType.Jumping then J.lastJump = now end
-        end
-
         if not config.dashAssist then active = false driver = nil return end
         local tr = getTargetRoot()
         local char = localPlayer.Character
@@ -2271,17 +2287,13 @@ do
 
         if not active then
             if h > SPIKE_ON and (lastH < SPIKE_OFF or h - lastH > SPIKE_JUMP) and tr then
-                startAssist(hrp, findDriver(hrp), now)
+                startAssist(hrp, findDriver(hrp))
             end
         else
             if (driver and not driver.Parent) or tick() > untilT then
                 active = false
                 driver = nil
                 TH.dashStatus = "dash terminado"
-            elseif config.assistIgnoreJump and J.lastReq > J.startT then
-                active = false
-                driver = nil
-                TH.dashStatus = "cancelado (saltaste durante el dash)"
             else
                 steer(hrp)
             end
@@ -2719,9 +2731,9 @@ do
 end
 
 -- ============================================================
--- ZEIDOP EXTRAS v9  (ya integrado en el hub)
+-- ZEIDOP EXTRAS v10.5  (ya integrado en el hub)
 -- Incluye: predict adaptativo, Jump Sync, pestana ESTILO y selector de listas.
--- Un solo Dash Assist (el clasico, con filtro de saltos). Sin V2, sin Lag automatico.
+-- Un solo Dash Assist (el clasico) con predict propio. Sin V2, sin Lag automatico, sin filtro de saltos.
 -- El cerebro del lock (cameraLockStep / faceStep / CAM_PRIORITY) NO se toca.
 -- ============================================================
 do
@@ -2733,7 +2745,7 @@ do
         jumpSync = true, jumpSyncNeedLock = true, jumpSyncRange = 25, jumpSyncDelay = 0, jumpSyncVy = 25,
         btnOpacity = 0, opacityMini = false,
         btnShape = { lock = "circle", jump = "circle", dash = "circle", mini = "circle" },
-        assistFollowLock = true, assistIgnoreJump = true, predictAdaptive = true, predictComp = 1.0,
+        assistFollowLock = true, predictAdaptive = true, predictComp = 1.0, dashPredict = 0.176,
     }
     for k, v in pairs(defaults) do
         if config[k] == nil then config[k] = v end
@@ -2915,14 +2927,14 @@ do
 
     local function collect(b)
         local list = { { b, "BackgroundTransparency", b.BackgroundTransparency } }
-        if b:IsA("TextButton") then list[#list + 1] = { b, "TextTransparency", b.TextTransparency } end
+        if b:IsA("TextButton") or b:IsA("TextBox") then list[#list + 1] = { b, "TextTransparency", b.TextTransparency } end
         for _, d in ipairs(b:GetDescendants()) do
             if d:IsA("UIStroke") then
                 list[#list + 1] = { d, "Transparency", d.Transparency }
             elseif d:IsA("ImageLabel") or d:IsA("ImageButton") then
                 list[#list + 1] = { d, "ImageTransparency", d.ImageTransparency }
                 list[#list + 1] = { d, "BackgroundTransparency", d.BackgroundTransparency }
-            elseif d:IsA("TextLabel") or d:IsA("TextButton") then
+            elseif d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
                 list[#list + 1] = { d, "TextTransparency", d.TextTransparency }
                 list[#list + 1] = { d, "BackgroundTransparency", d.BackgroundTransparency }
             end
@@ -3055,6 +3067,22 @@ do
         l.Parent = U.page
         return l
     end
+    -- igual que U.label pero escribible (TextBox); se usa junto con U.stepper
+    function U.labelBox(text, top, i, ncols, size)
+        local l = Instance.new("TextBox")
+        l.BackgroundTransparency = 1
+        l.Text = text
+        l.Font = Enum.Font.GothamBold
+        l.TextSize = size or 12
+        l.TextColor3 = C.dim
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.ClearTextOnFocus = true
+        l.Position = UDim2.new(0, 10, 0, U.rowY(top, i))
+        l.Size = UDim2.new(1, -(20 + 48 * ncols), 0, U.RH)
+        l.ZIndex = 2
+        l.Parent = U.page
+        return l
+    end
     function U.btn(text, top, i, side, color, size)
         local b = Instance.new("TextButton")
         b.Text = text
@@ -3108,6 +3136,17 @@ do
         end
         minus.MouseButton1Click:Connect(function() bump(-step) end)
         plus.MouseButton1Click:Connect(function() bump(step) end)
+        if lbl:IsA("TextBox") then
+            lbl.FocusLost:Connect(function()
+                local txt = (lbl.Text or ""):gsub(",", ".")
+                local n = tonumber(txt:match("%d*%.?%d+"))
+                if n then
+                    set(math.floor(math.clamp(n, lo, hi) * 100 + 0.5) / 100)
+                    saveConfig()
+                end
+                paint()
+            end)
+        end
     end
 
     -- barra arrastrable 0-100. Es un TextButton (Active) para que arrastrarla NO mueva el menu,
@@ -3331,15 +3370,18 @@ do
     U.use(dashPage)
     U.header("AJUSTES DEL ASSIST")
     do
-        local t = U.card(3)
-        local a = U.btn("", t, 1, "L", nil, 11)
-        U.toggle(a, "Sigue al lock", function() return config.assistFollowLock end, function(v) config.assistFollowLock = v end)
-        local j = U.btn("", t, 1, "R", nil, 11)
-        U.toggle(j, "Ignorar salto", function() return config.assistIgnoreJump end, function(v) config.assistIgnoreJump = v end)
-        W.eff = U.label("", t, 2, 0, 11)
-        W.dbg = U.label("", t, 3, 0, 11)
+        local t = U.card(4)
+        local f = U.btn("", t, 1, "F", nil, 12)
+        U.toggle(f, "Dash sigue al lock", function() return config.assistFollowLock end, function(v) config.assistFollowLock = v end)
+        config.dashPredict = math.min(0.300, config.dashPredict or 0.176)
+        local l = U.labelBox("", t, 2, 2, 12)
+        U.stepper(l, U.col("-", t, 2, 2), U.col("+", t, 2, 1), "Predict dash: %.0f ms",
+            function() return (config.dashPredict or 0.176) * 1000 end,
+            function(v) config.dashPredict = v / 1000 end, 0, 300, 1)
+        W.eff = U.label("", t, 3, 0, 11)
+        W.dbg = U.label("", t, 4, 0, 11)
     end
-    U.hint("Sigue al lock: con predict encendido el dash va al mismo punto que la camara. Ignorar salto: no corrige dashes hechos con salto.", 44)
+    U.hint("Predict dash es independiente del predict del lock: cambiarlo no mueve el M1 ni las habilidades. Con predict apagado el dash usa Lag / Max T.", 44)
     U.finish()
 
     -- la pestana LOCK es la que esta abierta al inicio: ajusta su scroll al nuevo largo
@@ -3356,8 +3398,9 @@ do
             if dashPage.Visible then
                 local l2
                 if config.assistFollowLock and config.predictEnabled then
-                    l2 = string.format("Dash apunta como el lock (predict %d ms)",
-                        math.floor((config.predictAmount + (config.liveComp or 0)) * 1000 + 0.5))
+                    l2 = string.format("Dash: predict %d ms + ajuste %d ms",
+                        math.floor((config.dashPredict or 0.176) * 1000 + 0.5),
+                        math.floor((config.liveComp or 0) * 1000 + 0.5))
                 else
                     l2 = "Dash con Lag / Max T fijos (engranaje)"
                 end
@@ -3381,5 +3424,5 @@ do
     end)
 end
 
-print("Zeidop Hub v9 OK - LOCK + ASSIST + PREDICT ADAPTATIVO + JUMP SYNC + ESTILO + SELECTOR")
-end
+print("Zeidop Hub v10.5 OK - LOCK + ASSIST (predict propio) + PREDICT ADAPTATIVO + JUMP SYNC + ESTILO + SELECTOR")
+endnd
